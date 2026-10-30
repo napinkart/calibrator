@@ -147,12 +147,39 @@ def scan_section(config):
         format_func=lambda i: projector_names[i]
     )
 
+    # Selector para cell_size (basado en sugerencia automática)
+    opt_cell = calculate_optimal_cell_size(1280, 720, projectors[0].get('width', 1920), projectors[0].get('height', 1080), current_cell=16)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        cell_size = st.number_input(
+            "Cell Size (px):",
+            min_value=8,
+            max_value=32,
+            value=config.get("scan", {}).get("cell_size", opt_cell),
+            help="Tamaño de celda. Sugerido para tu cámara: " + str(opt_cell)
+        )
+    with col_b:
+        if st.button("Aplicar Cell Size"):
+            config["scan"]["cell_size"] = int(cell_size)
+            save_config(config)
+            st.rerun()
+
     st.markdown(f"**Proyector seleccionado:** {projector_names[projector_index]}")
     st.info(f"📋 Pasos: 1) Asegúrate de que el proyector {projector_index + 1} esté activo. 2) Mueve la cámara para cubrir esa área. 3) Haz clic en 'Iniciar Escaneo'.")
 
+    # Agregar importación segura
+    try:
+        from lw.pipeline import scan_overlaps, scan_projector
+    except ImportError:
+        st.error("Error al importar scan_overlaps o scan_projector de lw.pipeline")
+        return config
+
+    # ... (resto del código de scan_section)
+
     if st.button("📷 Iniciar Escaneo", type="primary", disabled=not HAS_CLICKS):
-        from lw.pipeline import scan_projector
         try:
+            # Asegurar que se use el cell_size del config actual
             scan_projector(config, projector_index)
             st.success(f"✅ Escaneo completado para proyector {projector_index + 1}.")
             st.info(f"📁 Archivos generados: work/all_white_proj{projector_index}.png y work/scan_proj{projector_index}.npz")
@@ -2003,6 +2030,10 @@ elif step.startswith("4 "):
                 if _w4:
                     st.warning(_w4)
         _pp_cols = st.columns(len(_pp_projs))
+        # Asegurar importaciones al inicio de la función
+        from lw.pipeline import scan_overlaps, scan_projector
+
+        # En la parte del bucle de proyectores
         for _i, (_c, _p) in enumerate(zip(_pp_cols, _pp_projs)):
             with _c:
                 _ov = scan_overlaps(WORK, _i)
