@@ -204,14 +204,26 @@ def scan(rig, cfg: dict, work: Path, log=print):
         _record_scan(work, i, dec, meta, log)
 
 
-def calculate_optimal_cell_size(cam_w, cam_h, proj_w, proj_h, current_cell=16, min_pixels_per_cell=4, max_cell_size=32):
-    proj_per_cam = (proj_w / cam_w + proj_h / cam_h) / 2
-    pixels_per_cell = proj_per_cam * current_cell
-    if pixels_per_cell < min_pixels_per_cell:
-        return max(8, int(current_cell * (min_pixels_per_cell / max(1, pixels_per_cell))))
-    elif pixels_per_cell > 8:
-        return max(8, int(current_cell * (8 / pixels_per_cell)))
-    return current_cell
+def calculate_optimal_cell_size(cam_w, cam_h, proj_w, proj_h, current_cell=16, min_pixels_per_cell=5, max_cell_size=32):
+    """Calcula el cell_size del proyector para garantizar suficientes píxeles en cámara.
+
+    Si cada celda proyectada se ve de menos de `min_pixels_per_cell` píxeles en la cámara,
+    aumenta el cell_size para que los patrones sean nítidos y decodificables.
+    """
+    cam_w, cam_h = max(1, int(cam_w)), max(1, int(cam_h))
+    proj_w, proj_h = max(1, int(proj_w)), max(1, int(proj_h))
+
+    # Cuántos píxeles de cámara ocupa 1 celda de proyector
+    cam_px_per_cell = float(current_cell) * (cam_w / float(proj_w))
+
+    if cam_px_per_cell < min_pixels_per_cell:
+        # La celda es demasiado fina en la cámara: aumentar cell_size
+        scale = min_pixels_per_cell / max(0.1, cam_px_per_cell)
+        new_cell = int(np.ceil(current_cell * scale))
+    else:
+        new_cell = current_cell
+
+    return max(8, min(max_cell_size, int(new_cell)))
 
 
 def scan_projector(config, projector_index, work=None, log=print, rig=None):
@@ -227,16 +239,21 @@ def scan_projector(config, projector_index, work=None, log=print, rig=None):
         _log_camera(rig, log)
 
         # AUTO-CELL-SIZE
-        cam_h, cam_w = rig.camera_shape if hasattr(rig, 'camera_shape') else (1080, 1920)
+        cam_h, cam_w = rig.camera_shape if hasattr(rig, 'camera_shape') else (720, 1280)
         pw, ph = rig.proj_size(i)
-        old_cell = config["scan"].get("cell_size", 16)
+        old_cell = config.get("scan", {}).get("cell_size", 16)
         is_webcam = config.get("camera", {}).get("type") == "webcam"
         target_ppc = 6 if is_webcam else 4
         opt_cell = calculate_optimal_cell_size(cam_w, cam_h, pw, ph, current_cell=old_cell, min_pixels_per_cell=target_ppc)
 
-        log(f"  Proyector {i}: cell_size auto-ajustado a {opt_cell} (antes {old_cell})")
-        config["scan"]["cell_size"] = opt_cell
-        with open('config.json', 'w') as f: json.dump(config, f, indent=2)
+        if opt_cell != old_cell:
+            log(f"  Proyector {i}: cell_size auto-ajustado a {opt_cell} (antes {old_cell})")
+            config.setdefault("scan", {})["cell_size"] = opt_cell
+
+            # Guardar en config.json filtrando claves internas (_path, _work, etc.)
+            cfg_path = Path(config.get("_path", "config.json"))
+            clean_cfg = {k: v for k, v in config.items() if not str(k).startswith("_")}
+            cfg_path.write_text(json.dumps(clean_cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
         cell = opt_cell
         w, h = rig.proj_size(i)
