@@ -1,0 +1,49 @@
+{
+  "projectors": [
+    {
+      "name": "proyector1",
+      "x": 0,
+      "y": 0,
+      "width": 1366,
+      "height": 768
+    }
+  ],
+  "scan": {
+    "cell_size": 24,
+    "phase_steps": 8,
+    "phase_period": 48,
+    "min_contrast": 6,
+    "white_threshold": 12,
+    "pattern_intensity": 255,
+    "save_raw": true,
+    "skip_preflight": true
+  },
+  "mapping": {
+    "smoothing": 1.0,
+    "min_pixels_per_cell": 2
+  },
+  "screen": {
+    "edge_param": "arclength"
+  },
+  "blend": {
+    "max_width_px": 0,
+    "power": 1.0,
+    "black_blur_px": 25,
+    "respect_shadows": false
+  },
+  "uniformity": {
+    "camera_gamma": 2.2,
+    "percentile": 5,
+    "smooth_px": 30
+  },
+  "work_dir": "work",
+  "output_dir": "output",
+  "camera": {
+    "type": "webcam",
+    "index": 7,
+    "backend": "dshow",
+    "sync": "auto",
+    "settle_ms": 8000,
+    "sync_timeout_ms": 6000
+  }
+}

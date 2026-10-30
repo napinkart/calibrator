@@ -1,0 +1,38 @@
+Escena 'convex3': 3 proyectores (1920, 1080), cámara (1920, 1080)
+== Escaneo simulado ==
+  proyector 0: 46 patrones capturados en 42.5s     
+  proyector 0: 11.5% de píxeles de cámara decodificados
+  proyector 1: 46 patrones capturados en 29.8s     
+  proyector 1: 28.7% de píxeles de cámara decodificados
+  proyector 2: 46 patrones capturados en 34.5s     
+  proyector 2: 11.5% de píxeles de cámara decodificados
+== Cálculo ==
+Calculando coordenadas de contenido (parche de Coons)...
+Proyector 0: mapa proyector->cámara (1920x1080, celda 16px)...
+   celdas decodificadas 5898/8160, usadas 5896, ~7.4 px cámara/celda
+Proyector 1: mapa proyector->cámara (1920x1080, celda 16px)...
+   celdas decodificadas 7654/8160, usadas 7654, ~9.0 px cámara/celda
+Proyector 2: mapa proyector->cámara (1920x1080, celda 16px)...
+   celdas decodificadas 5898/8160, usadas 5896, ~7.4 px cámara/celda
+Calculando blending y nivel de negro...
+   brillo mín/máx en pantalla (sin compensar): 0.515, luz conservada con Uniformity=1: 81%
+Listo -> G:\wall\librewarp\calibrator\sim_output
+Tiempo total: 279.7s
+
+Proyector 0: cobertura válida 71.1%
+   error geométrico  mediana 0.151px  p95 0.273px  máx 10.09px
+   error UV (x1000)  mediana 0.55  p95 6.62
+Proyector 1: cobertura válida 93.0%
+   error geométrico  mediana 0.004px  p95 0.173px  máx 0.95px
+   error UV (x1000)  mediana 0.03  p95 0.19
+Proyector 2: cobertura válida 71.1%
+   error geométrico  mediana 0.151px  p95 0.271px  máx 9.11px
+   error UV (x1000)  mediana 0.55  p95 6.62
+
+Suma de pesos de blend sobre la pantalla: media 0.9999  p1 0.9985  p99 1.0001
+
+Uniformidad de brillo en pantalla con blanco completo (luz real, p1/p99):
+   Uniformity=0:  mín/máx = 0.704   variación (CV) = 10.6%   brillo medio = 0.706
+   Uniformity=1:  mín/máx = 0.904   variación (CV) = 2.2%   brillo medio = 0.565
+
+RESULTADO: OK

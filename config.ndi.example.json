@@ -1,0 +1,80 @@
+{
+  "camera": {
+    "type": "ndi",
+    "index": 0,
+    "backend": "dshow",
+    "width": 1920,
+    "height": 1080,
+    "auto_exposure": false,
+    "auto_exposure_off_value": 0.25,
+    "exposure": -6,
+    "gain": null,
+    "focus": null,
+    "settle_ms": 450,
+    "flush_frames": 5,
+    "avg_frames": 4,
+    "ndi_source": "",
+    "ndi_ips": "",
+    "ndi_color": "uyvy",
+    "sync": "auto",
+    "sync_min_ms": 100,
+    "sync_timeout_ms": 4000,
+    "sync_stable_frames": 2
+  },
+  "displays": [
+    {
+      "name": "QuadHead2Go",
+      "x": 1920,
+      "y": 0,
+      "width": 5760,
+      "height": 1080,
+      "layout": "3x1"
+    }
+  ],
+  "projectors": [
+    {
+      "name": "izquierda",
+      "display": 0,
+      "output": 1
+    },
+    {
+      "name": "centro",
+      "display": 0,
+      "output": 2
+    },
+    {
+      "name": "derecha",
+      "display": 0,
+      "output": 3
+    }
+  ],
+  "scan": {
+    "cell_size": 16,
+    "phase_steps": 8,
+    "phase_period": 32,
+    "min_contrast": 10,
+    "white_threshold": 25,
+    "pattern_intensity": 255,
+    "save_raw": false
+  },
+  "mapping": {
+    "smoothing": 1.0,
+    "min_pixels_per_cell": 2
+  },
+  "screen": {
+    "edge_param": "uniform"
+  },
+  "blend": {
+    "max_width_px": 0,
+    "power": 1.0,
+    "black_blur_px": 25,
+    "respect_shadows": false
+  },
+  "uniformity": {
+    "camera_gamma": 2.2,
+    "percentile": 5,
+    "smooth_px": 30
+  },
+  "work_dir": "work",
+  "output_dir": "output"
+}

@@ -1,0 +1,8 @@
+numpy>=1.24
+opencv-python>=4.8,<5   # 5.x ya no escribe EXR (los mapas son .exr)
+scipy>=1.10
+screeninfo>=0.8
+cyndilib>=0.1.3
+streamlit>=1.36
+streamlit-image-coordinates>=0.0.4
+pygrabber>=0.2        # nombres amigables de cámaras DirectShow (Windows)

@@ -1,0 +1,78 @@
+{
+  "projectors": [
+    {
+      "name": "proyector1",
+      "display": 0,
+      "output": 1
+    },
+    {
+      "name": "proyector2",
+      "display": 0,
+      "output": 2
+    },
+    {
+      "name": "proyector3",
+      "display": 0,
+      "output": 3
+    }
+  ],
+  "scan": {
+    "cell_size": 16,
+    "phase_steps": 8,
+    "phase_period": 48,
+    "min_contrast": 6,
+    "white_threshold": 12,
+    "pattern_intensity": 255,
+    "save_raw": true,
+    "skip_preflight": true
+  },
+  "mapping": {
+    "smoothing": 1.0,
+    "min_pixels_per_cell": 2
+  },
+  "screen": {
+    "edge_param": "arclength"
+  },
+  "blend": {
+    "max_width_px": 0,
+    "narrow": 1.0,
+    "power": 1.0,
+    "black_blur_px": 25,
+    "respect_shadows": false,
+    "overlap_frac": 0.15,
+    "overlap_source": "measured"
+  },
+  "uniformity": {
+    "camera_gamma": 2.2,
+    "percentile": 5,
+    "smooth_px": 30
+  },
+  "work_dir": "work",
+  "output_dir": "output",
+  "camera": {
+    "type": "webcam",
+    "index": 5,
+    "backend": "dshow",
+    "sync": "auto",
+    "settle_ms": 8000,
+    "sync_timeout_ms": 6000,
+    "auto_exposure": false,
+    "exposure": -1,
+    "gain": 0
+  },
+  "section_mode": false,
+  "current_section": -1,
+  "sections": [],
+  "surface_type": "concave",
+  "surface_radius": 10.0,
+  "displays": [
+    {
+      "name": "Splitter/\\\\.\\DISPLAY2",
+      "x": 1920,
+      "y": 0,
+      "width": 7680,
+      "height": 1080,
+      "layout": "4x1"
+    }
+  ]
+}

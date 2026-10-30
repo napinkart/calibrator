@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LibreWarp - Guía Visual para Marcar Bordes</title>
+    <style>
+        body { margin: 0; padding: 0; background: #222; font-family: Arial, sans-serif; }
+        #container { position: relative; width: 100%; height: 100vh; display: flex; justify-content: center; align-items: center; }
+        #canvas { border: 2px solid #333; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+        .tooltip { position: absolute; background: rgba(0,0,0,0.8); color: #fff; padding: 5px 10px; border-radius: 4px; font-size: 12px; pointer-events: none; opacity: 0; transition: opacity 0.2s; z-index: 100; }
+        .legend { position: absolute; top: 10px; left: 10px; background: rgba(255,255,255,0.9); padding: 10px; border-radius: 5px; font-size: 12px; max-width: 300px; }
+        .legend h2 { margin: 0 0 5px 0; font-size: 14px; font-weight: bold; }
+        .legend-item { margin: 3px 0; display: flex; align-items: center; }
+        .legend-color { width: 20px; height: 2px; margin-right: 8px; border-radius: 2px; }
+        .warning { position: absolute; top: 10px; right: 10px; background: rgba(255,0,0,0.9); color: #fff; padding: 10px; border-radius: 5px; font-size: 12px; display: none; }
+        .btn { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); background: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; }
+        .btn:hover { background: #45a049; }
+    </style>
+</head>
+<body>
+    <div class="legend">
+        <h2>Guía de Bordes para LibreWarp</h2>
+        <div class="legend-item"><div class="legend-color" style="background: #C0C0C0;"></div><span>Borde Sugerido (transparente)</span></div>
+        <div class="legend-item"><div class="legend-color" style="background: #FF9966;"></div><span>Ventana de Lienzo Esperada (amarilla)</span></div>
+        <div class="legend-item"><div class="legend-color" style="background: #FF0000;"></div><span>⚠️ Advertencia: Borde muy desviado (>20px)</span></div>
+        <div style="margin-top: 10px; font-size: 11px; color: #888;">
+            <strong>Cómo usar:</strong> Haz clic en la imagen para agregar un punto.<br>
+            <strong>Consejo:</strong> Alinea los puntos sugeridos con los bordes reales de la pantalla.<br>
+            <strong>Solape:</strong> La zona amarilla muestra dónde los proyectores deben superponerse perfectamente.
+        </div>
+    </div>
+    <div id="warning" class="warning">
+        ⚠️ ¡Borde demasiado desviado! El solape podría romperse. Ajusta el punto o cancela.
+    </div>
+    <div id="container">
+        <canvas id="canvas"></canvas>
+        <div id="tooltip" class="tooltip"></div>
+    </div>
+    <button class="btn" onclick="resetPoints()">Reiniciar Puntos</button>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const tooltip = document.getElementById('tooltip');
+        const warning = document.getElementById('warning');
+
+        let points = {
+            top: [],
+            right: [],
+            bottom: [],
+            left: []
+        };
+        let suggested = {
+            top: [[150, 114], [809, 114]],
+            right: [[802, 111], [803, 483]],
+            bottom: [[150, 480], [809, 480]],
+            left: [[153, 112], [157, 483]]
+        };
+        let activeEdge = null;
+        let isDragging = false;
+        let lastMousePos = null;
+
+        // Cargar imagen de fondo (reemplazar con tu imagen real)
+        const img = new Image();
+        img.onload = initCanvas;
+        img.src = 'work/all_white_proj0.png';
+
+        function initCanvas() {
+            canvas.width = img.width;
+            canvas.height = img.height;
+            draw();
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // Dibujar imagen de fondo con bajo contraste
+            ctx.globalAlpha = 0.7;
+            ctx.drawImage(img, 0, 0);
+            ctx.globalAlpha = 1;
+
+            // Dibujar bordes sugeridos (transparentes)
+            drawSuggested();
+
+            // Dibujar ventanas de lienzo esperadas (amarillas)
+            drawCanvasWindows();
+
+            // Dibujar puntos actuales
+            drawCurrentPoints();
+
+            // Dibujar advertencia si es necesario
+            checkWarnings();
+        }
+
+        function drawSuggested() {
+            for (const [edge, pts] of Object.entries(suggested)) {
+                if (pts.length < 2) continue;
+                ctx.strokeStyle = '#C0C0C0';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([5, 5]);
+                ctx.beginPath();
+                ctx.moveTo(pts[0][0], pts[0][1]);
+                ctx.lineTo(pts[1][0], pts[1][1]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Números en los extremos
+                for (let i = 0; i < 2; i++) {
+                    const p = pts[i];
+                    ctx.fillStyle = '#FFFFFF';
+                    ctx.font = '12px Arial';
+                    ctx.fillText(`${edge[0].toUpperCase()}-${i+1}`, p[0] - 10, p[1] - 10);
+                }
+            }
+        }
+
+        function drawCanvasWindows() {
+            const wins = [[0.1, 0.38], [0.32, 0.68], [0.62, 1.0]]; // u0, u1 para 3 proyectores
+            const colors = ['#FF9966', '#FF9966', '#FF9966'];
+            for (let i = 0; i < wins.length; i++) {
+                const [u0, u1] = wins[i];
+                const w = (u1 - u0) * canvas.width;
+                const h = 0.4 * canvas.height;
+                let x, y;
+                if (i === 0) { x = u0 * canvas.width; y = 0.1 * canvas.height; }
+                else if (i === wins.length - 1) { x = u1 * canvas.width - w; y = 0.6 * canvas.height; }
+                else { x = u0 * canvas.width; y = 0.3 * canvas.height; }
+
+                ctx.fillStyle = colors[i];
+                ctx.globalAlpha = 0.3;
+                ctx.fillRect(x, y, w, h);
+                ctx.globalAlpha = 1;
+                ctx.strokeStyle = '#FFFFFF';
+                ctx.lineWidth = 1;
+                ctx.strokeRect(x, y, w, h);
+                ctx.fillStyle = '#FFFFFF';
+                ctx.font = '12px Arial';
+                ctx.fillText(`P${i+1}`, x + 2, y + 12);
+            }
+        }
+
+        function drawCurrentPoints() {
+            for (const [edge, pts] of Object.entries(points)) {
+                if (pts.length === 0) continue;
+                ctx.strokeStyle = '#FFFFFF';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(pts[0][0], pts[0][1]);
+                for (let i = 1; i < pts.length; i++) {
+                    ctx.lineTo(pts[i][0], pts[i][1]);
+                }
+                ctx.stroke();
+
+                // Dibujar círculos en los puntos
+                for (let i = 0; i < pts.length; i++) {
+                    ctx.fillStyle = '#00FF00';
+                    ctx.beginPath();
+                    ctx.arc(pts[i][0], pts[i][1], 4, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.strokeStyle = '#000000';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                }
+            }
+        }
+
+        function checkWarnings() {
+            let anyWarning = false;
+            for (const [edge, pts] of Object.entries(points)) {
+                if (pts.length < 2) continue;
+                const suggestedPts = suggested[edge];
+                if (!suggestedPts || suggestedPts.length < 2) continue;
+
+                // Calcular distancia promedio a los puntos sugeridos
+                let totalDist = 0;
+                for (let i = 0; i < pts.length; i++) {
+                    const p = pts[i];
+                    const sp = suggestedPts[Math.min(i, suggestedPts.length-1)];
+                    const dx = p[0] - sp[0];
+                    const dy = p[1] - sp[1];
+                    totalDist += Math.sqrt(dx*dx + dy*dy);
+                }
+                const avgDist = totalDist / pts.length;
+
+                if (avgDist > 20) {
+                    anyWarning = true;
+                    // Mostrar advertencia cerca del borde
+                    const midPt = pts[Math.floor(pts.length/2)];
+                    ctx.fillStyle = '#FF0000';
+                    ctx.font = 'bold 14px Arial';
+                    ctx.fillText('⚠️ BORDE DESVIADO', midPt[0] - 30, midPt[1] - 20);
+                }
+            }
+            warning.style.display = anyWarning ? 'block' : 'none';
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            // Dibujar imagen de fondo con bajo contraste
+            ctx.globalAlpha = 0.6;
+            ctx.drawImage(img, 0, 0);
+            ctx.globalAlpha = 1;
+
+            drawSuggested();
+            drawCanvasWindows();
+            drawCurrentPoints();
+            checkWarnings();
+        }
+
+        // Manejo de eventos del ratón
+        canvas.addEventListener('mousedown', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            // Detectar sobre qué borde estamos (simple aproximación)
+            let overEdge = null;
+            for (const [edge, pts] of Object.entries(suggested)) {
+                if (pts.length < 2) continue;
+                const dx = x - pts[0][0];
+                const dy = y - pts[0][1];
+                const dx2 = x - pts[1][0];
+                const dy2 = y - pts[1][1];
+                if (Math.abs(dx) < 20 && Math.abs(dy) < 20) overEdge = edge;
+                else if (Math.abs(dx2) < 20 && Math.abs(dy2) < 20) overEdge = edge;
+            }
+
+            if (overEdge) {
+                activeEdge = overEdge;
+                isDragging = true;
+                lastMousePos = {x, y};
+                // Mostrar tooltip
+                tooltip.style.left = (e.clientX + 10) + 'px';
+                tooltip.style.top = (e.clientY + 10) + 'px';
+                tooltip.innerHTML = `Arrastra para mover el punto de ${activeEdge}`;
+                tooltip.style.opacity = '1';
+            }
+        });
+
+        canvas.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            // Mover el último punto del borde activo
+            if (activeEdge && points[activeEdge].length > 0) {
+                points[activeEdge][points[activeEdge].length - 1] = [x, y];
+                draw();
+
+                // Actualizar tooltip
+                tooltip.style.left = (e.clientX + 10) + 'px';
+                tooltip.style.top = (e.clientY + 10) + 'px';
+            }
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            isDragging = false;
+            tooltip.style.opacity = '0';
+        });
+
+        // Clic para agregar nuevo punto
+        canvas.addEventListener('click', (e) => {
+            if (isDragging) return; // Evitar agregar mientras arrastramos
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            // Encontrar borde cercano
+            let closestEdge = null;
+            let minDist = Infinity;
+            for (const [edge, pts] of Object.entries(suggested)) {
+                if (pts.length < 2) continue;
+                const d1 = Math.hypot(x - pts[0][0], y - pts[0][1]);
+                const d2 = Math.hypot(x - pts[1][0], y - pts[1][1]);
+                const d = Math.min(d1, d2);
+                if (d < minDist) {
+                    minDist = d;
+                    closestEdge = edge;
+                }
+            }
+
+            if (closestEdge) {
+                // Agregar punto al final de la lista del borde
+                points[closestEdge].push([x, y]);
+                draw();
+            }
+        });
+
+        function resetPoints() {
+            points = { top: [], right: [], bottom: [], left: [] };
+            draw();
+        }
+
+        // Botón para exportar puntos a JSON (para usar en LibreWarp)
+        const exportBtn = document.createElement('button');
+        exportBtn.textContent = 'Exportar Puntos';
+        exportBtn.className = 'btn';
+        exportBtn.style.left = '50%';
+        exportBtn.style.transform = 'translateX(-50%) translateX(100px)';
+        exportBtn.onclick = () => {
+            const jsonStr = JSON.stringify(points, null, 2);
+            const blob = new Blob([jsonStr], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'bordes_calibrados.json';
+            a.click();
+        };
+        document.getElementById('container').appendChild(exportBtn);
+    </script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class*
+.Python
+env/
+.venv/
+.venv.roto-313/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables
+.env
+.env.*
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Calibration work and output directories (keep templates/examples)
+work/
+output/
+sim_work/
+sim_output/
+sim_work_convex3_work/
+*.npy
+*.exr
+*.tmp
