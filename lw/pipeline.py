@@ -158,10 +158,12 @@ def _capture_sequence(rig, cfg: dict, i: int, work: Path, log=print) -> dict:
             for f in raw.glob("*.png"): f.unlink()
         raw.mkdir(exist_ok=True)
     t0 = time.time()
+    settle = cfg.get("camera", {}).get("settle_ms", 500) / 1000.0
     for k, (name, img) in enumerate(patterns.make_sequence(
             w, h, cell, sc.get("pattern_intensity", 255), phase_steps,
             sc.get("phase_period", 32), False)):
         rig.show_only(i, img)
+        time.sleep(settle)
         cap = rig.capture()
         if raw is not None:
             cv2.imwrite(str(raw / f"{name}.png"),
@@ -499,13 +501,18 @@ def _content_geometry(cfg, work, log=print):
 
     uvls = []
     for i in range(n):
-        uvl = cv2.remap(np.nan_to_num(cam_uvs[i], nan=-10.0), pmaps[i][0], pmaps[i][1], cv2.INTER_LINEAR)
+        # Asegurar que los mapas sean float32 explícitamente para evitar error de tipo booleano
+        map_x = pmaps[i][0].astype(np.float32)
+        map_y = pmaps[i][1].astype(np.float32)
+        uvl = cv2.remap(np.nan_to_num(cam_uvs[i], nan=-10.0), map_x, map_y, cv2.INTER_LINEAR)
         ok = pmaps[i][1] & (uvl[..., 0] > -5.0)
         if ok.sum() > 1000:
             u0, u1 = np.percentile(uvl[..., 0][ok], 0.2), np.percentile(uvl[..., 0][ok], 99.8)
             v0, v1 = np.percentile(uvl[..., 1][ok], 0.2), np.percentile(uvl[..., 1][ok], 99.8)
             cam_uvs[i] = np.stack([(cam_uvs[i][..., 0] - u0) / (u1 - u0), (cam_uvs[i][..., 1] - v0) / (v1 - v0)], -1)
-            uvl = cv2.remap(np.nan_to_num(cam_uvs[i], nan=-10.0), pmaps[i][0], pmaps[i][1], cv2.INTER_LINEAR)
+            map_x = pmaps[i][0].astype(np.float32)
+            map_y = pmaps[i][1].astype(np.float32)
+            uvl = cv2.remap(np.nan_to_num(cam_uvs[i], nan=-10.0), map_x, map_y, cv2.INTER_LINEAR)
         uvls.append(uvl)
 
     wins, overlaps, span = _content_windows(_content_overlaps(cfg, work, decs, cam_uvs))
@@ -534,6 +541,11 @@ def compute_per_projector(cfg, work, out, log=print):
         valid = geo["pmaps"][i][1] & (u >= 0) & (u <= 1)
         x, y = np.where(valid, u * Wc - 0.5, -100.0), np.where(valid, v * Hc - 0.5, -100.0)
         wgt = cv2.remap(weights[i], x.astype(np.float32), y.astype(np.float32), cv2.INTER_LINEAR)
+        # Rellenar huecos en los mapas usando inpainting
+        valid_mask = (valid).astype(np.uint8) * 255
+        wgt = cv2.inpaint(wgt, cv2.bitwise_not(valid_mask), 3, cv2.INPAINT_TELEA)
+        lf = cv2.inpaint(lf, cv2.bitwise_not(valid_mask), 3, cv2.INPAINT_TELEA)
+        gn = cv2.inpaint(gn, cv2.bitwise_not(valid_mask), 3, cv2.INPAINT_TELEA)
         lf = cv2.remap(lift, x.astype(np.float32), y.astype(np.float32), cv2.INTER_LINEAR)
         gn = cv2.remap(gain, x.astype(np.float32), y.astype(np.float32), cv2.INTER_LINEAR)
         uo, vo = np.where(valid, u, -1.0), np.where(valid, 1.0 - v, -1.0)
