@@ -554,11 +554,25 @@ def zoom_view(img_bgr, edges, active, dw: int, center, zoom: float, fine=None):
     return vis, ix, iy, cw, ch, dh
 
 
-def click_component(img_bgr, width: int, key: str):
+def click_component(img_bgr, key: str):
+    """Devuelve el clic en coordenadas de LA IMAGEN (no de la pantalla).
+
+    La imagen se estira al ancho disponible de la columna (`width="stretch"`):
+    así se ve **entera** en cualquier monitor. Antes se le pasaba un ancho fijo de
+    1100 px y, si la columna era más angosta, la ventana del componente la cortaba
+    con un scroll horizontal interno (y los clics de la parte visible quedaban
+    desfasados).
+
+    El componente devuelve el clic en píxeles CSS de la imagen ya escalada y el
+    tamaño al que la dibujó (`width`/`height`); aquí se reescala a píxeles de la
+    imagen que se dibujó, que es lo que espera quien llama.
+    """
     if not HAS_CLICKS:
         return None
-    rgb = cv2.cvtColor(_bgr(img_bgr), cv2.COLOR_BGR2RGB)
-    val = streamlit_image_coordinates(rgb, width=int(width), key=key,
+    vis = _bgr(img_bgr)
+    h, w = vis.shape[:2]
+    rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+    val = streamlit_image_coordinates(rgb, width="stretch", key=key,
                                       click_and_drag=False, cursor="crosshair")
     if not val or val.get("x") is None:
         return None
@@ -567,7 +581,11 @@ def click_component(img_bgr, width: int, key: str):
     if seen.get(key) == stamp:
         return None
     seen[key] = stamp
-    return float(val["x"]), float(val["y"])
+    dw = float(val.get("width") or 0) or float(w)
+    dh = float(val.get("height") or 0) or float(h)
+    x = min(max(float(val["x"]) * w / dw, 0.0), w - 1.0)
+    y = min(max(float(val["y"]) * h / dh, 0.0), h - 1.0)
+    return x, y
 
 
 def save_screen(edges: dict, mode: str, path: Path | None = None) -> str:
@@ -2469,7 +2487,7 @@ elif step.startswith("5 "):
                     st.rerun()
 
             ov, sx, sy = overview_view(img_over, edges, cur, DW, fine)
-            ov_click = click_component(ov, DW, CK("click_overview"))
+            ov_click = click_component(ov, CK("click_overview"))
             if ov_click:
                 p = [float(ov_click[0] / sx), float(ov_click[1] / sy)]
                 pts.append(p)
@@ -2506,7 +2524,7 @@ elif step.startswith("5 "):
 
             zv, ix, iy, cw, ch, dh = zoom_view(img_zoom, edges, cur, DW,
                                                st.session_state["_zc"], zoom, fine)
-            zv_click = click_component(zv, DW, CK("click_zoom"))
+            zv_click = click_component(zv, CK("click_zoom"))
             if zv_click:
                 p = [float(ix + zv_click[0] * cw / DW), float(iy + zv_click[1] * ch / dh)]
                 if pts and fine is not None:

@@ -4,5 +4,5 @@ scipy>=1.10
 screeninfo>=0.8
 cyndilib>=0.1.3
 streamlit>=1.36
-streamlit-image-coordinates>=0.0.4
+streamlit-image-coordinates>=0.4.1  # width="stretch" (ver la imagen de marcado entera)
 pygrabber>=0.2        # nombres amigables de cámaras DirectShow (Windows)
