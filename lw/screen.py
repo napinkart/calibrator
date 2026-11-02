@@ -80,8 +80,10 @@ def camera_uv(edges: dict, cam_w: int, cam_h: int, mode="arclength",
     if x1 <= x0 or y1 <= y0:
         raise RuntimeError("La pantalla definida queda fuera de la imagen de cámara")
     gy, gx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
-    for c, src in enumerate([uu.ravel(), vv.ravel()]):
-        out[y0:y1 + 1, x0:x1 + 1, c] = griddata(P, src, (gx, gy), method="linear")
+    # las dos coordenadas en UNA sola interpolación (mismo resultado, la mitad
+    # de tiempo: en un escaneo real esto son varios segundos por proyector)
+    vals = griddata(P, np.stack([uu.ravel(), vv.ravel()], -1), (gx, gy), method="linear")
+    out[y0:y1 + 1, x0:x1 + 1] = vals
     return out
 
 

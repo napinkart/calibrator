@@ -7,11 +7,16 @@ Prueba end-to-end con el rig virtual (sin hardware):
 Mide el error del mapa geométrico, de las coordenadas de contenido, la suma de
 blending y la uniformidad de brillo contra el ground truth del simulador.
 """
-import os, sys, json, time, argparse
+import io, os, sys, json, time, argparse
 from pathlib import Path
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 import numpy as np
 import cv2
+
+# En una consola de Windows con cp1252/cp850 los avisos con emoji revientan
+# (UnicodeEncodeError) y abortan la prueba: se fuerza UTF-8, como en calibrate.py.
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 sys.path.insert(0, str(Path(__file__).parent))
 from lw.sim import VirtualRig, SCENES

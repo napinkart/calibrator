@@ -488,8 +488,14 @@ def cmd_section_scan(args):
     temp_cfg_path = cfg["_work"] / f"section_{idx}_temp.json"
     temp_cfg_path.write_text(json.dumps(temp_cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     # Ejecuta el scan normal con esta configuración temporal
+    from lw.devices import RealRig
     try:
-        pipeline.scan(temp_cfg_path, cfg["_work"])
+        cfg_sec = load_cfg(temp_cfg_path)
+        rig = RealRig(cfg_sec)
+        try:
+            pipeline.scan(rig, cfg_sec, cfg["_work"])
+        finally:
+            rig.close()
     except RuntimeError as e:
         sys.exit(str(e))
     # Guarda los resultados en la carpeta de la sección
@@ -514,36 +520,17 @@ def cmd_section_scan(args):
     _log_status(cfg, "section_scan_complete", {"section_index": idx, "scan_dir": str(sect_dir)})
 
 def cmd_stitch_sections(args):
-    """Une mapas de todas las secciones en un solo EXR por proyector."""
-    import cv2
+    """Une las secciones en UN solo juego de mapas (un lienzo común)."""
     from pathlib import Path
     cfg = load_cfg(args.config)
-    if not cfg.get("section_mode"):
-        sys.exit("Modo secciones no está habilitado. Usar --section-mode primero.")
-    output_dir = Path(args.output_dir) if args.output_dir else cfg["_out"]
+    output_dir = Path(args.output_dir) if getattr(args, "output_dir", None) else cfg["_out"]
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Para cada proyector, carga mapas de todas las secciones
-    for proj in cfg["projectors"]:
-        maps = []
-        for sect in cfg["sections"]:
-            if proj["index"] in sect.get("projectors", []):
-                scan_dir = Path(sect.get("scan_dir", cfg["_work"]))
-                map_path = scan_dir / f"proj{proj['index']}_map.exr"
-                if not map_path.exists():
-                    sys.exit(f"Falta mapa para proyector {proj['index']} en sección {sect.get('id')}")
-                maps.append(cv2.imread(str(map_path), cv2.IMREAD_UNCHANGED))
-        if not maps:
-            continue
-        # Une usando correspond.py (función existente)
-        final_map = pipeline.stitch_maps(maps, cfg)
-        out_path = output_dir / f"proj{proj['index']}_map.exr"
-        cv2.imwrite(str(out_path), final_map)
-        print(f"Guardado {out_path}")
-    # Regenera calibration.json con la malla unida
+    print("Uniendo las secciones en un solo juego de mapas (espacio de contenido)...")
     try:
-        pipeline.compute(cfg, cfg["_work"], cfg["_out"])
+        pipeline.compute(cfg, cfg["_work"], output_dir)
     except Exception as e:
-        sys.exit(f"Fallo al compute unido: {e}")
+        sys.exit(f"\nERROR al unir las secciones: {e}")
+    print(f"Mapas unidos en {output_dir}")
     _log_status(cfg, "stitch_complete", {"output_dir": str(output_dir)})
 
 def cmd_sections_status(args):
@@ -596,20 +583,6 @@ def cmd_clean_sections(args):
     save_cfg(cfg)
     print("Modo secciones limpiado y desactivado.")
     _log_status(cfg, "clean_sections", {"reset": True})
-
-# Registrar comandos en main()
-    ap.add_argument('--section-mode', action='store_true', dest='section_mode', help='Activar modo de escaneo por secciones')
-    ap.add_argument('--no-section-mode', action='store_false', dest='section_mode', help='Desactivar modo de escaneo por secciones')
-    ap.add_argument('--section-index', type=int, help='Índice de la sección a escanear (requerido para section_scan)')
-    ap.add_argument('--threshold', type=float, default=0.5, help='Umbral para verify_sections')
-    ap.add_argument('--confirm', action='store_true', help='Confirmar limpieza de secciones')
-    ap.add_argument('--output-dir', help='Directorio de salida para stitch_sections')
-
-    args = ap.parse_args()
-    globals()[f"cmd_{args.command}"](args)
-
-
-
 
 
 def main():

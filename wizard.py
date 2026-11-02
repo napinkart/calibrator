@@ -2723,6 +2723,15 @@ elif step.startswith("6 "):
         elif (OUT / "camera_overview.png").exists():
             st.image(str(OUT / "camera_overview.png"),
                      caption="camera_overview.png — huellas y rejilla")
+        _marked6 = sorted(OUT.glob("screen*_marked.png"))
+        if _marked6:
+            st.subheader("🖼️ Imagen de marcado, completa")
+            st.caption("La foto sobre la que marcaste los puntos, **entera y sin recortar**, "
+                       "con los puntos de cada borde y la rejilla del lienzo que se usa en los "
+                       "mapas. Si la rejilla no coincide con la zona que ilumina el proyector, "
+                       "vuelve al paso 5 y corrige los puntos.")
+            for _m6 in _marked6:
+                st.image(str(_m6), caption=_m6.name, use_container_width=True)
         if st.button("📝 Registrar esta sesión en la bóveda Obsidian"):
             st.info(obsidian_log_session(m))
 

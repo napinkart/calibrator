@@ -83,6 +83,27 @@ def camera_weights(masks: list[np.ndarray], max_width: float = 0.0,
     return ws
 
 
+def normalize_weights(weights: list[np.ndarray], masks: list[np.ndarray],
+                      eps: float = 1e-6) -> list[np.ndarray]:
+    """Fuerza que la suma de pesos sea 1 en TODA la zona cubierta.
+
+    La distancia al borde vale 0 justo en el borde de la huella, así que sin
+    esto el filo de cada proyector se queda sin peso y en la pared aparece un
+    contorno negro de 1 px (un hueco del cálculo, no de la superficie). Donde
+    ninguna huella tiene distancia (el borde exacto) se reparte a partes
+    iguales entre las que cubren ese punto.
+    """
+    tot = np.sum(weights, axis=0)
+    n = np.sum([m.astype(np.float32) for m in masks], axis=0)
+    ok = tot > eps
+    out = []
+    for w, m in zip(weights, masks):
+        w = np.where(ok, w / np.maximum(tot, eps),
+                     np.where(m & (n > 0), 1.0 / np.maximum(n, 1.0), 0.0))
+        out.append(w.astype(np.float32))
+    return out
+
+
 def narrow_weights(weights: list[np.ndarray], k: float = 1.0) -> list[np.ndarray]:
     """Adelgaza k veces la rampa de mezcla alrededor de w=0.5 (centro de la costura).
 

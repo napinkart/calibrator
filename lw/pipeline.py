@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import cv2
+from scipy import ndimage
 
 from . import patterns, correspond, screen, blend
 
@@ -384,6 +385,250 @@ def per_projector_scans(cfg: dict, work: Path) -> bool:
     return n > 0 and any((work / f"all_white_proj{i}.png").exists() for i in range(n))
 
 
+# --------------------------------------------------------------------------
+# RELLENO DE HUECOS (para no entregar mapas con agujeros del sistema)
+# --------------------------------------------------------------------------
+def _solid_mask(mask: np.ndarray, close_px: int = 3,
+                max_hole_frac: float = 0.02) -> np.ndarray:
+    """Devuelve la máscara SIN huecos interiores pequeños.
+
+    El decodificado y los filtros del mapeo dejan píxeles sueltos y agujeros
+    de pocos píxeles (sobre todo en los bordes). Proyectados se ven como
+    puntos o rayas negras en la pared, y no vienen de la pared sino del
+    cálculo. Aquí se cierran: sólo huecos INTERIORES (que no tocan el borde
+    de la imagen) y pequeños (< max_hole_frac del área), para no inventar luz
+    donde de verdad no llega (sombras, oclusiones, un borde de la sala).
+    """
+    m = np.asarray(mask, bool)
+    if not m.any():
+        return m
+    k = max(1, int(close_px)) | 1                    # impar
+    closed = cv2.morphologyEx(m.astype(np.uint8), cv2.MORPH_CLOSE,
+                              np.ones((k, k), np.uint8)) > 0
+    inv = (~closed).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(inv, 4)
+    H, W = closed.shape
+    out = closed.copy()
+    lim = max(64.0, float(max_hole_frac) * float(m.sum()))
+    for j in range(1, n):
+        x, y, w, h, area = st[j]
+        if x == 0 or y == 0 or x + w >= W or y + h >= H:
+            continue                                 # abierto al borde: no es hueco
+        if area <= lim:
+            out |= (lab == j)
+    return out
+
+
+def _fill_nearest(img: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Rellena cada píxel no válido con el valor válido MÁS CERCANO."""
+    v = np.asarray(valid, bool)
+    out = np.asarray(img, np.float32)
+    if v.all():
+        return out
+    if not v.any():
+        return np.zeros_like(out, np.float32)
+    idx = ndimage.distance_transform_edt(~v, return_distances=False,
+                                         return_indices=True)
+    return out[tuple(idx)].astype(np.float32)
+
+
+def _sample_map(img, x, y, border: float = 0.0) -> np.ndarray:
+    """Muestrea un mapa (lienzo o cámara) en coordenadas de píxel (x, y)."""
+    return cv2.remap(np.ascontiguousarray(img, np.float32),
+                     np.ascontiguousarray(x, np.float32),
+                     np.ascontiguousarray(y, np.float32),
+                     cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                     borderValue=border)
+
+
+def _grow_mask(mask, px: int = 2) -> np.ndarray:
+    k = 2 * int(px) + 1
+    return cv2.dilate(np.ascontiguousarray(mask, np.uint8),
+                      np.ones((k, k), np.uint8)) > 0
+
+
+def _blend_weights(cfg: dict, masks: list):
+    """Pesos de mezcla que suman 1 en TODA la zona cubierta.
+
+    Las máscaras se engordan 2 px SÓLO para calcular el peso: si no, el
+    muestreo bilineal en el borde exacto de la huella devuelve 0 y el mapa
+    sale con un filo negro de 1 px (un «hueco» del cálculo, no de la pared).
+    """
+    wm = [_grow_mask(m, 2) for m in masks]
+    weights = blend.normalize_weights(blend.camera_weights(wm), wm)
+    narrow = float((cfg.get("blend") or {}).get("narrow") or 1.0)
+    if narrow > 1.0:
+        weights = blend.normalize_weights(blend.narrow_weights(weights, narrow), wm)
+    return weights, wm
+
+
+def _aspect_hint(edges: dict) -> float | None:
+    """Aspecto de la pantalla marcada, medido en la imagen de cámara."""
+    try:
+        def L(k):
+            q = np.asarray(edges[k], np.float64)
+            return float(np.sum(np.hypot(*np.diff(q, axis=0).T)))
+        wdt = 0.5 * (L("top") + L("bottom"))
+        hgt = 0.5 * (L("left") + L("right"))
+        return round(wdt / hgt, 3) if hgt > 1e-6 else None
+    except Exception:
+        return None
+
+
+def _max_overlap(masks: list) -> float:
+    """Mayor solape entre proyectores vecinos (fracción del más pequeño)."""
+    best = 0.0
+    for a, b in zip(masks, masks[1:]):
+        inter = float(np.logical_and(a, b).sum())
+        small = float(min(a.sum(), b.sum()))
+        if small > 0:
+            best = max(best, inter / small)
+    return round(best, 4)
+
+
+PROJ_COLORS = [(80, 80, 255), (80, 200, 80), (255, 160, 60), (255, 80, 200),
+               (80, 220, 220), (200, 120, 255)]
+
+
+def _write_exr(out: Path, i: int, w, v, u, lift, gain) -> None:
+    """Escribe el mapa del proyector (B=w, G=v, B=u) y su mapa de negro."""
+    one = np.ones_like(u, np.float32)
+    cv2.imwrite(str(Path(out) / f"proj{i}_map.exr"),
+                np.dstack([w, v, u, one]).astype(np.float32))
+    cv2.imwrite(str(Path(out) / f"proj{i}_black.exr"),
+                np.dstack([np.zeros_like(u, np.float32), gain, lift, one]).astype(np.float32))
+
+
+def _projector_entries(cfg: dict, results: list, windows=None) -> list:
+    out = []
+    for i, p in enumerate(cfg["projectors"]):
+        ent = {"index": i, "name": p.get("name", f"proyector{i}"),
+               "width": int(p["width"]), "height": int(p["height"]),
+               "desktop_x": int(p.get("desktop_x", 0)),
+               "desktop_y": int(p.get("desktop_y", 0)),
+               "file": f"proj{i}_map.exr", "black_file": f"proj{i}_black.exr"}
+        if windows is not None and i < len(windows):
+            ent["content_window"] = [round(float(windows[i][0]), 6),
+                                     round(float(windows[i][1]), 6)]
+        else:
+            ent["content_window"] = [0.0, 1.0]
+        if i < len(results) and results[i] is not None:
+            ent["valid_pct"] = round(float(np.mean(results[i]["valid"])) * 100, 1)
+        out.append(ent)
+    return out
+
+
+def _write_calibration(cfg: dict, out: Path, mode: str, results: list, *,
+                       windows=None, canvas=None, aspect=None, max_overlap=None,
+                       uniformity=None, warnings=None, log=print) -> dict:
+    meta = {"version": 2,
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "mode": mode,
+            "aspect_hint_from_camera": aspect,
+            "max_overlap": max_overlap,
+            "uniformity": uniformity or {},
+            "displays": cfg.get("displays", []),
+            "projectors": _projector_entries(cfg, results, windows)}
+    if windows is not None:
+        meta["content_windows"] = [[round(float(a), 6), round(float(b), 6)]
+                                  for a, b in windows]
+    if canvas:
+        meta["canvas"] = canvas
+    if warnings:
+        meta["warnings"] = list(warnings)
+    (Path(out) / "calibration.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(f"  calibración: {Path(out) / 'calibration.json'}")
+    return meta
+
+
+def _marked_image(img_path: Path, edges: dict, mode: str, title: str):
+    """La imagen donde se marcaron los puntos, ENTERA, con los puntos y la
+    rejilla del lienzo que se va a usar (para comprobar que el marcado cubre
+    toda la pantalla)."""
+    img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+    if img is None or not edges:
+        return None
+    vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    try:
+        t = np.linspace(0.0, 1.0, 21)
+        for a in t[1:-1]:
+            for P in (screen.coons(edges, np.full_like(t, a), t, mode),
+                      screen.coons(edges, t, np.full_like(t, a), mode)):
+                cv2.polylines(vis, [np.rint(P).astype(np.int32).reshape(-1, 1, 2)],
+                              False, (170, 170, 170), 1, cv2.LINE_AA)
+    except Exception:
+        pass
+    colors = {"top": (0, 0, 255), "right": (0, 210, 0),
+              "bottom": (255, 110, 0), "left": (255, 0, 255)}
+    for k, pts in edges.items():
+        q = np.rint(np.asarray(pts, np.float64)).astype(np.int32)
+        if len(q) >= 2:
+            cv2.polylines(vis, [q.reshape(-1, 1, 2)], False,
+                          colors.get(k, (255, 255, 255)), 2, cv2.LINE_AA)
+        for p in q:
+            cv2.circle(vis, (int(p[0]), int(p[1])), 4,
+                       colors.get(k, (255, 255, 255)), -1, cv2.LINE_AA)
+            cv2.circle(vis, (int(p[0]), int(p[1])), 5, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(vis, title, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(vis, title, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 1, cv2.LINE_AA)
+    return vis
+
+
+def _overview_camera(work: Path, pmaps: list, out: Path):
+    """Vista de cámara ENTERA con la huella de cada proyector."""
+    img = None
+    for name in ("all_white.png",):
+        p = Path(work) / name
+        if p.exists():
+            img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+            break
+    if img is None:
+        return None
+    vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    for i, pm in enumerate(pmaps):
+        col = PROJ_COLORS[i % len(PROJ_COLORS)]
+        pmap = pm[0] if isinstance(pm, tuple) else pm
+        poly = np.concatenate([pmap[0], pmap[:, -1], pmap[-1][::-1],
+                               pmap[:, 0][::-1]])
+        poly = np.rint(poly).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(vis, [poly], True, col, 2, cv2.LINE_AA)
+        c = poly.reshape(-1, 2).mean(0).astype(int)
+        for th, cc in ((3, (0, 0, 0)), (1, col)):
+            cv2.putText(vis, f"P{i}", (int(c[0]), int(c[1])),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, cc, th, cv2.LINE_AA)
+    cv2.imwrite(str(Path(out) / "camera_overview.png"), vis)
+    return vis
+
+
+def _overview_canvas(geo: dict, out: Path):
+    """Lienzo de contenido: dónde cae cada proyector y por dónde van las
+    costuras. Es el espacio que ve TouchDesigner como una sola imagen."""
+    Hc, Wc = geo["Hc"], geo["Wc"]
+    vis = np.full((Hc, Wc, 3), 35, np.uint8)
+    for i, m in enumerate(geo["masks"]):
+        col = np.asarray(PROJ_COLORS[i % len(PROJ_COLORS)], np.float32)
+        vis[m] = (0.72 * vis[m].astype(np.float32) + 0.28 * col).astype(np.uint8)
+        cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, cnts, -1, tuple(int(c) for c in col), 2)
+        ys, xs = np.nonzero(m)
+        if len(xs):
+            x, y = int(np.median(xs)), int(np.median(ys))
+            for th, cc in ((3, (0, 0, 0)), (1, tuple(int(c) for c in col))):
+                cv2.putText(vis, f"P{i}", (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9, cc, th, cv2.LINE_AA)
+    for k in range(len(geo["wins"]) - 1):
+        x = int(round(geo["wins"][k][1] * Wc))
+        cv2.line(vis, (x, 0), (x, Hc - 1), (255, 255, 255), 1, cv2.LINE_AA)
+        lbl = f"P{k}-P{k+1} {geo['overlaps'][k] * 100:.0f}%"
+        for th, cc in ((3, (0, 0, 0)), (1, (255, 255, 255))):
+            cv2.putText(vis, lbl, (max(2, x + 6), 26), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, cc, th, cv2.LINE_AA)
+    cv2.imwrite(str(Path(out) / "content_overview.png"), vis)
+    return vis
+
+
 def compute(cfg: dict, work: Path, out: Path, edges=None, edge_mode=None, log=print):
     if edges is None and per_projector_scans(cfg, work):
         return compute_per_projector(cfg, work, out, log=log)
@@ -401,28 +646,64 @@ def compute(cfg: dict, work: Path, out: Path, edges=None, edge_mode=None, log=pr
     maps = []
     for i, d in enumerate(decs):
         w, h, cell = int(d["width"]), int(d["height"]), int(d["cell"])
-        pmap, pvalid, st = correspond.projector_to_camera(d, w, h, cell)
+        pmap, pvalid, st = correspond.projector_to_camera(
+            d, w, h, cell,
+            cfg.get("mapping", {}).get("min_pixels_per_cell", 2),
+            cfg.get("mapping", {}).get("smoothing", 1.0))
         maps.append((pmap, pvalid, st))
 
     masks = [blend.footprint(pm, (cam_h, cam_w)) for (pm, _, _), d in zip(maps, decs)]
-    weights = blend.camera_weights(masks)
+    weights, _wmasks = _blend_weights(cfg, masks)
     lift, nmax = blend.black_lift(masks, screen_mask)
-    gain, _ = blend.uniformity_gain([d["white"] for d in decs], [d["black"] for d in decs], masks, weights, screen_mask)
+    gain, ustats = blend.uniformity_gain([d["white"] for d in decs],
+                                        [d["black"] for d in decs],
+                                        masks, weights, screen_mask)
 
+    ncov = np.sum([m.astype(np.float32) for m in masks], axis=0)
     results = []
     for i, (d, (pmap, pvalid, st)) in enumerate(zip(decs, maps)):
-        uv = cv2.remap(np.nan_to_num(cam_uv, nan=-10.0), pmap[..., 0], pmap[..., 1], cv2.INTER_LINEAR)
-        wgt = blend.sample(weights[i], pmap)
-        lf = blend.sample(lift, pmap)
-        gn = blend.sample(gain, pmap, border=1.0)
-        valid = pvalid & np.all((uv >= 0) & (uv <= 1), axis=-1)
-        u, v = np.where(valid, uv[..., 0], -1.0), np.where(valid, 1.0 - uv[..., 1], -1.0)
+        uv = _sample_map(np.nan_to_num(cam_uv, nan=-10.0), pmap[..., 0], pmap[..., 1],
+                         border=-10.0)
+        # zona que este proyector DEBE iluminar: su huella ∩ la pantalla marcada
+        inside = (pvalid & np.all(np.isfinite(uv), -1)
+                  & (uv[..., 0] >= -0.01) & (uv[..., 0] <= 1.01)
+                  & (uv[..., 1] >= -0.01) & (uv[..., 1] <= 1.01))
+        solid = _solid_mask(inside) & pvalid            # sin huecos del sistema
+        u = np.where(solid, np.clip(uv[..., 0], 0, 1), -1.0).astype(np.float32)
+        v = np.where(solid, 1.0 - np.clip(uv[..., 1], 0, 1), -1.0).astype(np.float32)
+        know = solid & (u >= 0)
+        if know.any() and not know.all():                # hueco sin coordenada
+            uf = _fill_nearest(np.where(know, u, 0.0), know)
+            vf = _fill_nearest(np.where(know, v, 0.0), know)
+            u = np.where(solid, uf, -1.0).astype(np.float32)
+            v = np.where(solid, vf, -1.0).astype(np.float32)
 
-        fname, bname = f"proj{i}_map.exr", f"proj{i}_black.exr"
-        cv2.imwrite(str(out / fname), np.dstack([wgt, v, u, np.ones_like(u)]))
-        cv2.imwrite(str(out / bname), np.dstack([np.zeros_like(u), gn, lf, np.ones_like(u)]))
+        x, y = pmap[..., 0], pmap[..., 1]
+        wgt = np.where(solid, np.clip(_sample_map(weights[i], x, y), 0, 1), 0.0).astype(np.float32)
+        lf = np.where(solid, _sample_map(lift, x, y), 0.0).astype(np.float32)
+        gn = np.where(solid, _sample_map(gain, x, y, border=1.0), 1.0).astype(np.float32)
+        # si aun así quedara un píxel a 0 dentro de la pantalla Y nadie más lo
+        # cubre, que ilumine: antes un píxel con luz que un agujero negro
+        gap = solid & (wgt <= 1e-3) & (_sample_map(ncov, x, y) < 1.5)
+        if gap.any():
+            wf = _fill_nearest(np.where(gap, 0.0, wgt), ~gap & solid)
+            wgt = np.where(gap, np.maximum(wgt, wf), wgt).astype(np.float32)
+
+        _write_exr(out, i, wgt, v, u, lf, gn)
+        valid = solid & (u >= 0)
+        cv2.imwrite(str(out / f"proj{i}_preview.png"), preview(u, v, wgt))
         results.append(dict(pmap=pmap, u=u, v=v, w=wgt, lift=lf, gain=gn, valid=valid))
+
+    _write_calibration(cfg, out, "single_pose", results,
+                       aspect=_aspect_hint(edges), max_overlap=_max_overlap(masks),
+                       uniformity=ustats, log=log)
+    _overview_camera(work, maps, out)
+    marked = _marked_image(work / "all_white.png", edges, edge_mode,
+                           "pantalla marcada - imagen completa")
+    if marked is not None:
+        cv2.imwrite(str(out / "screen_marked.png"), marked)
     return results, {}
+
 
 def per_projector_ready(cfg, work):
     work = Path(work)
@@ -445,7 +726,11 @@ def _overlap_local(work, i, j, dec, cam_uv, side, wt):
     diff = np.clip(nb.astype(np.float32) - dec["black"].astype(np.float32), 0, None)
     hi = float(np.percentile(diff, 99.5))
     if hi <= max(float(wt), 10.0): return None
-    lit = diff > max(0.5 * hi, float(wt))
+    # 15 % del pico, no el 50 %: el solape es TODO lo que el vecino ilumina,
+    # y en los bordes del solape su luz ya viene cayendo (viñeta, rampa).
+    # Con el 50 % el solape medido sale mucho menor que el real y la costura
+    # queda desalineada (banda oscura / doble brillo).
+    lit = diff > max(0.15 * hi, float(wt))
     uu = cam_uv[..., 0]
     ok = lit & np.isfinite(uu) & (uu >= 0) & (uu <= 1)
     if ok.sum() < 200: return None
@@ -470,7 +755,11 @@ def _content_windows(sides):
     Ls = [1.0]
     for k in range(n - 1):
         a, b = sides[k]
-        Ls.append(Ls[-1] * (a / b) if b > 1e-6 and 0.85 <= a / b <= 1.18 else Ls[-1])
+        # el solape es el MISMO trozo de pared para los dos: a*W_i = b*W_j,
+        # o sea W_j/W_i = a/b. Se acepta un rango amplio (en una pantalla
+        # curva un proyector puede estar bastante más lejos que su vecino);
+        # sólo se descarta si la medida es absurda.
+        Ls.append(Ls[-1] * (a / b) if b > 1e-6 and 0.5 <= a / b <= 2.0 else Ls[-1])
     Ov = [sides[k][0] * Ls[k] for k in range(n - 1)]
     span = max(sum(Ls) - sum(Ov), 1e-3)
     wins, s = [], 0.0
@@ -490,68 +779,300 @@ def _rasterize(values, x, y, keep, shape):
     return np.where(cnt > 0, tot / np.maximum(cnt, 1), 0).astype(np.float32), cnt > 0
 
 def _content_geometry(cfg, work, log=print):
+    """Geometría en el espacio de CONTENIDO (un lienzo común a todos los
+    proyectores), con el marcado de puntos de cada uno como forma de pantalla."""
     n = len(cfg["projectors"])
-    decs, pmaps, cam_uvs = [], [], []
+    decs, pmaps, cam_uvs, edges_l = [], [], [], []
     for i in range(n):
-        d = dict(np.load(work / f"scan_proj{i}.npz"))
-        pmap, pvalid, st = correspond.projector_to_camera(d, int(d["width"]), int(d["height"]), int(d["cell"]))
-        edges, mode = screen.load_edges(work / f"screen_proj{i}.json")
-        cam_uv = screen.camera_uv(edges, d["valid"].shape[1], d["valid"].shape[0], mode or "arclength")
-        decs.append(d); pmaps.append((pmap, pvalid, st)); cam_uvs.append(cam_uv)
+        p = Path(work) / f"scan_proj{i}.npz"
+        if not p.exists():
+            raise RuntimeError(f"Falta el escaneo del proyector {i} ({p}).")
+        d = dict(np.load(p))
+        pmap, pvalid, st = correspond.projector_to_camera(
+            d, int(d["width"]), int(d["height"]), int(d["cell"]),
+            cfg.get("mapping", {}).get("min_pixels_per_cell", 2),
+            cfg.get("mapping", {}).get("smoothing", 1.0))
+        sp = Path(work) / f"screen_proj{i}.json"
+        if not sp.exists():
+            raise RuntimeError(f"Faltan los bordes del proyector {i} ({sp}): marca los "
+                               f"puntos en el paso 5.")
+        edges, mode = screen.load_edges(sp)
+        faltan = [k for k in screen.EDGES if len(edges.get(k) or []) < 2]
+        if faltan:
+            raise RuntimeError(
+                f"El marcado del proyector {i} ({sp.name}) está incompleto: faltan "
+                f"puntos en {', '.join(faltan)} (hacen falta ≥2 por borde). Vuelve al "
+                f"paso 5 y marca los 4 bordes de la pantalla de ese proyector.")
+        cam_uv = screen.camera_uv(edges, d["valid"].shape[1], d["valid"].shape[0],
+                                  mode or "arclength")
+        decs.append(d); pmaps.append((pmap, pvalid, st))
+        cam_uvs.append(cam_uv); edges_l.append(edges)
 
     uvls = []
     for i in range(n):
-        # Asegurar que los mapas sean float32 explícitamente para evitar error de tipo booleano
-        map_x = pmaps[i][0].astype(np.float32)
-        map_y = pmaps[i][1].astype(np.float32)
-        uvl = cv2.remap(np.nan_to_num(cam_uvs[i], nan=-10.0), map_x, map_y, cv2.INTER_LINEAR)
-        ok = pmaps[i][1] & (uvl[..., 0] > -5.0)
+        pmap = pmaps[i][0]
+        uvl = _sample_map(np.nan_to_num(cam_uvs[i], nan=-10.0),
+                          pmap[..., 0], pmap[..., 1], border=-10.0)
+        # La pantalla marcada ES el marco del proyector: se lleva a 0..1 exacto
+        # con sus propios percentiles (el marcado son sus 4 bordes).
+        ok = pmaps[i][1] & (uvl[..., 0] > -5) & (uvl[..., 1] > -5)
         if ok.sum() > 1000:
             u0, u1 = np.percentile(uvl[..., 0][ok], 0.2), np.percentile(uvl[..., 0][ok], 99.8)
             v0, v1 = np.percentile(uvl[..., 1][ok], 0.2), np.percentile(uvl[..., 1][ok], 99.8)
-            cam_uvs[i] = np.stack([(cam_uvs[i][..., 0] - u0) / (u1 - u0), (cam_uvs[i][..., 1] - v0) / (v1 - v0)], -1)
-            map_x = pmaps[i][0].astype(np.float32)
-            map_y = pmaps[i][1].astype(np.float32)
-            uvl = cv2.remap(np.nan_to_num(cam_uvs[i], nan=-10.0), map_x, map_y, cv2.INTER_LINEAR)
+            if (u1 - u0) > 1e-3 and (v1 - v0) > 1e-3:
+                cam_uvs[i] = np.stack([(cam_uvs[i][..., 0] - u0) / (u1 - u0),
+                                       (cam_uvs[i][..., 1] - v0) / (v1 - v0)], -1)
+                uvl = _sample_map(np.nan_to_num(cam_uvs[i], nan=-10.0),
+                                  pmap[..., 0], pmap[..., 1], border=-10.0)
         uvls.append(uvl)
 
     wins, overlaps, span = _content_windows(_content_overlaps(cfg, work, decs, cam_uvs))
     Wc, Hc = _content_raster_size(cfg, span)
-    uvs = [(wins[i][0] + uvls[i][..., 0] * (wins[i][1] - wins[i][0]), uvls[i][..., 1]) for i in range(n)]
-    masks = [blend.clean_mask(_rasterize(np.ones(u.shape), u * Wc - 0.5, v * Hc - 0.5, pmaps[i][1] & (u>=0) & (u<=1), (Hc, Wc))[0] > 0) for i, (u, v) in enumerate(uvs)]
-    return dict(decs=decs, pmaps=pmaps, uvs=uvs, wins=wins, overlaps=overlaps, span=span, Wc=Wc, Hc=Hc, cam_shape=decs[0]["valid"].shape, masks=masks)
+    uvs, masks = [], []
+    for i in range(n):
+        u = wins[i][0] + uvls[i][..., 0] * (wins[i][1] - wins[i][0])
+        v = uvls[i][..., 1]
+        uvs.append((u.astype(np.float32), v.astype(np.float32)))
+        keep = pmaps[i][1] & (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
+        r, _ = _rasterize(np.ones(u.shape, np.float32), u * Wc - 0.5, v * Hc - 0.5,
+                          keep, (Hc, Wc))
+        masks.append(blend.clean_mask(r > 0))
+    return dict(decs=decs, pmaps=pmaps, uvs=uvs, wins=wins, overlaps=overlaps,
+                span=span, Wc=Wc, Hc=Hc, cam_shape=decs[0]["valid"].shape,
+                masks=masks, edges=edges_l)
+
 
 def compute_per_projector(cfg, work, out, log=print):
+    """Modo por proyector: cada escaneo tiene su pose de cámara y su marcado,
+    así que el blend se calcula en el espacio de CONTENIDO (un lienzo común).
+    Todos los mapas comparten las mismas coordenadas de imagen."""
+    if not exr_available():
+        raise RuntimeError(exr_error_msg())
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     geo = _content_geometry(cfg, work, log=log)
-    Wc, Hc, n = geo["Wc"], geo["Hc"], len(cfg["projectors"])
-    scale = Wc / (geo["span"] * int(cfg["projectors"][0]["width"]))
-    weights = blend.camera_weights(geo["masks"])
-    lift, nmax = blend.black_lift(geo["masks"], None, 25 * scale)
+    _save_canvas_cache(geo, cfg, work)      # el paso 6 ya no lo recalcula
+    n = len(cfg["projectors"])
+    Wc, Hc = geo["Wc"], geo["Hc"]
+    scale = Wc / max(geo["span"] * int(cfg["projectors"][0]["width"]), 1e-6)
+
+    weights, _wmasks = _blend_weights(cfg, geo["masks"])
+    tot = np.sum(weights, axis=0).astype(np.float32)
+    ncov = np.sum([m.astype(np.float32) for m in geo["masks"]], axis=0)
+    lift, nmax = blend.black_lift(geo["masks"], None, 25.0 * scale)
 
     whites_c, blacks_c = [], []
     for i in range(n):
-        x, y = geo["uvs"][i][0] * Wc - 0.5, geo["uvs"][i][1] * Hc - 0.5
-        wc, _ = _rasterize(blend.sample(geo["decs"][i]["white"], geo["pmaps"][i][0]), x, y, geo["pmaps"][i][1], (Hc, Wc))
-        bc, _ = _rasterize(blend.sample(geo["decs"][i]["black"], geo["pmaps"][i][0]), x, y, geo["pmaps"][i][1], (Hc, Wc))
+        pmap, pvalid, _ = geo["pmaps"][i]
+        u, v = geo["uvs"][i]
+        x = np.where(pvalid, u * Wc - 0.5, -100.0).astype(np.float32)
+        y = np.where(pvalid, v * Hc - 0.5, -100.0).astype(np.float32)
+        wc, _ = _rasterize(blend.sample(geo["decs"][i]["white"], pmap), x, y,
+                           pvalid, (Hc, Wc))
+        bc, _ = _rasterize(blend.sample(geo["decs"][i]["black"], pmap), x, y,
+                           pvalid, (Hc, Wc))
         whites_c.append(wc); blacks_c.append(bc)
-    gain, _ = blend.uniformity_gain(whites_c, blacks_c, geo["masks"], weights, np.any(geo["masks"], axis=0))
+    gain, ustats = blend.uniformity_gain(whites_c, blacks_c, geo["masks"], weights,
+                                         np.any(geo["masks"], axis=0))
 
+    results = []
     for i in range(n):
         u, v = geo["uvs"][i]
-        valid = geo["pmaps"][i][1] & (u >= 0) & (u <= 1)
-        x, y = np.where(valid, u * Wc - 0.5, -100.0), np.where(valid, v * Hc - 0.5, -100.0)
-        wgt = cv2.remap(weights[i], x.astype(np.float32), y.astype(np.float32), cv2.INTER_LINEAR)
-        # Rellenar huecos en los mapas usando inpainting
-        valid_mask = (valid).astype(np.uint8) * 255
-        wgt = cv2.inpaint(wgt, cv2.bitwise_not(valid_mask), 3, cv2.INPAINT_TELEA)
-        lf = cv2.inpaint(lf, cv2.bitwise_not(valid_mask), 3, cv2.INPAINT_TELEA)
-        gn = cv2.inpaint(gn, cv2.bitwise_not(valid_mask), 3, cv2.INPAINT_TELEA)
-        lf = cv2.remap(lift, x.astype(np.float32), y.astype(np.float32), cv2.INTER_LINEAR)
-        gn = cv2.remap(gain, x.astype(np.float32), y.astype(np.float32), cv2.INTER_LINEAR)
-        uo, vo = np.where(valid, u, -1.0), np.where(valid, 1.0 - v, -1.0)
-        cv2.imwrite(str(out / f"proj{i}_map.exr"), np.dstack([wgt, vo, uo, np.ones_like(uo)]))
-        cv2.imwrite(str(out / f"proj{i}_black.exr"), np.dstack([np.zeros_like(uo), gn, lf, np.ones_like(uo)]))
-    return [], {}
+        keep = geo["pmaps"][i][1]
+        w0, w1 = geo["wins"][i]
+        # SOLO la ventana de este proyector: fuera de ella el contenido es del
+        # vecino y proyectarlo ahí sería contenido duplicado y luz doble.
+        inside = (keep & (u >= w0 - 0.005) & (u <= w1 + 0.005)
+                  & (v >= -0.005) & (v <= 1.005))
+        solid = _solid_mask(inside) & keep          # sin huecos del sistema
+        know = inside & np.isfinite(u) & np.isfinite(v)
+        if know.any():
+            # los huecos rellenados toman la coordenada del vecino válido más
+            # cercano: si no, caerían en 0 (contenido del extremo del lienzo)
+            uf = _fill_nearest(np.where(know, u, 0.0), know)
+            vf = _fill_nearest(np.where(know, v, 0.0), know)
+        else:
+            uf, vf = u, v
+        uc = np.where(solid, np.clip(uf, w0, w1), -1.0).astype(np.float32)
+        vc = np.where(solid, np.clip(vf, 0.0, 1.0), -1.0).astype(np.float32)
+        x = np.where(solid, uc * Wc - 0.5, -100.0).astype(np.float32)
+        y = np.where(solid, vc * Hc - 0.5, -100.0).astype(np.float32)
+
+        wgt = np.where(solid, np.clip(_sample_map(weights[i], x, y), 0, 1), 0.0).astype(np.float32)
+        lf = np.where(solid, _sample_map(lift, x, y), 0.0).astype(np.float32)
+        gn = np.where(solid, _sample_map(gain, x, y, border=1.0), 1.0).astype(np.float32)
+        # hueco real del lienzo (ningún proyector llega): antes que un agujero
+        # negro, se reparte la luz entre los que sí cubren ese punto
+        gap = solid & (_sample_map(tot, x, y) < 0.05)
+        if gap.any():
+            nc = np.maximum(_sample_map(ncov, x, y, border=1.0), 1.0)
+            wgt = np.where(gap, np.maximum(wgt, (1.0 / nc)).astype(np.float32), wgt).astype(np.float32)
+
+        uo = np.where(solid, uc, -1.0).astype(np.float32)
+        vo = np.where(solid, 1.0 - vc, -1.0).astype(np.float32)
+        _write_exr(out, i, wgt, vo, uo, lf, gn)
+        cv2.imwrite(str(out / f"proj{i}_preview.png"), preview(uo, vo, wgt))
+        valid = solid & (uo >= 0)
+        results.append(dict(pmap=geo["pmaps"][i][0], u=uo, v=vo, w=wgt,
+                            lift=lf, gain=gn, valid=valid))
+        log(f"  proyector {i}: {valid.mean() * 100:.1f}% de su imagen proyecta contenido")
+
+    _write_calibration(cfg, out, "per_projector", results,
+                       windows=geo["wins"], canvas={"width": Wc, "height": Hc},
+                       aspect=_aspect_hint(geo["edges"][0]),
+                       max_overlap=round(float(max(geo["overlaps"] or [0.0])), 4),
+                       uniformity=ustats, log=log)
+    _overview_canvas(geo, out)
+    for i in range(n):
+        p = Path(work) / f"all_white_proj{i}.png"
+        sp = Path(work) / f"screen_proj{i}.json"
+        if p.exists() and sp.exists():
+            e_i, m_i = screen.load_edges(sp)
+            mk = _marked_image(p, e_i, m_i,
+                               f"P{i} - pantalla marcada (imagen completa)")
+            if mk is not None:
+                cv2.imwrite(str(out / f"screen_proj{i}_marked.png"), mk)
+    return results, {"canvas": {"width": Wc, "height": Hc}, "windows": geo["wins"]}
+
+# --------------------------------------------------------------------------
+# VISTA PREVIA DE LAS COSTURAS (paso 6 del wizard)
+# --------------------------------------------------------------------------
+def _scan_stamp(cfg: dict, work) -> str:
+    """Huella de los archivos que definen la geometría (escaneos y marcados)."""
+    h = hashlib.md5()
+    for i in range(len(cfg.get("projectors", []))):
+        for pat in (f"scan_proj{i}.npz", f"screen_proj{i}.json",
+                    f"overlap_proj{i}_vecino*"):
+            for p in sorted(Path(work).glob(pat)):
+                try:
+                    s = p.stat()
+                except OSError:
+                    continue
+                h.update(f"{p.name}:{int(s.st_mtime_ns)}:{s.st_size}".encode())
+    return h.hexdigest()
+
+
+def geometry_cached(cfg: dict, work) -> bool:
+    """¿La geometría de las costuras ya está calculada para ESTOS archivos?"""
+    p = Path(work) / "seam_geometry.npz"
+    if not p.exists():
+        return False
+    try:
+        with np.load(p) as d:
+            return str(d["key"]) == _scan_stamp(cfg, work)
+    except Exception:
+        return False
+
+
+def _canvas_geometry(cfg: dict, work):
+    """Huellas del lienzo: del caché si sigue valiendo; si no, se calculan y
+    se guardan en work/seam_geometry.npz (así la vista previa es instantánea)."""
+    p = Path(work) / "seam_geometry.npz"
+    key = _scan_stamp(cfg, work)
+    if p.exists():
+        try:
+            with np.load(p) as d:
+                if str(d["key"]) == key:
+                    Wc, Hc = int(d["Wc"]), int(d["Hc"])
+                    packed = d["masks"]
+                    masks = [np.unpackbits(packed[i], axis=1)[:, :Wc].astype(bool)
+                             for i in range(packed.shape[0])]
+                    return dict(Wc=Wc, Hc=Hc, span=float(d["span"]),
+                                wins=[tuple(float(x) for x in w) for w in d["wins"]],
+                                overlaps=[float(o) for o in d["overlaps"]],
+                                masks=masks)
+        except Exception:
+            pass
+    geo = _content_geometry(cfg, work, log=lambda *a, **k: None)
+    _save_canvas_cache(geo, cfg, work)
+    return geo
+
+
+def _save_canvas_cache(geo: dict, cfg: dict, work) -> None:
+    """Guarda sólo lo que necesita la vista previa (huellas del lienzo), no
+    los mapas densos del proyector: así el caché son unos cientos de KB."""
+    try:
+        np.savez_compressed(
+            Path(work) / "seam_geometry.npz",
+            key=_scan_stamp(cfg, work), Wc=geo["Wc"], Hc=geo["Hc"], span=geo["span"],
+            wins=np.asarray(geo["wins"], np.float64),
+            overlaps=np.asarray(geo["overlaps"], np.float64),
+            masks=np.stack([np.packbits(m.astype(np.uint8), axis=1) for m in geo["masks"]]))
+    except Exception:
+        pass
+
+
+def seam_preview(cfg: dict, work, narrow: float = 1.0) -> dict:
+    """Cómo quedan las costuras con las huellas REALES del escaneo.
+
+    Imagen (RGB) del lienzo de contenido: cada proyector tiñe su zona con su
+    peso de mezcla, así se ve el ancho real de cada rampa y dónde se solapan
+    dos proyectores. Devuelve también, por costura, el ancho de banda en px de
+    lienzo y de la imagen del proyector, y la suma de luz (debe dar 1).
+    """
+    geo = _canvas_geometry(cfg, work)
+    Wc, Hc = int(geo["Wc"]), int(geo["Hc"])
+    masks, wins = geo["masks"], geo["wins"]
+    wm = [_grow_mask(m, 2) for m in masks]
+    weights = blend.normalize_weights(blend.camera_weights(wm), wm)
+    if float(narrow or 1.0) > 1.0:
+        weights = blend.normalize_weights(blend.narrow_weights(weights, float(narrow)), wm)
+    total = np.sum(weights, axis=0)
+
+    img = np.zeros((Hc, Wc, 3), np.float32)
+    for i, w in enumerate(weights):
+        img += w[..., None] * np.asarray(PROJ_COLORS[i % len(PROJ_COLORS)], np.float32)
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    for i, m in enumerate(masks):
+        cnts, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(img, cnts, -1, tuple(int(c) for c in
+                         PROJ_COLORS[i % len(PROJ_COLORS)]), 1)
+        ys, xs = np.nonzero(m)
+        if len(xs):
+            cv2.putText(img, f"P{i}", (int(np.median(xs)), int(np.median(ys))),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    seams = []
+    for k in range(len(masks) - 1):
+        both = masks[k] & masks[k + 1]
+        band = both & (weights[k] > 0.02) & (weights[k] < 0.98)
+        def _median_width(m):
+            w = []
+            for r in range(Hc):
+                xs = np.flatnonzero(m[r])
+                if xs.size:
+                    w.append(int(xs[-1] - xs[0] + 1))
+            return float(np.median(w)) if w else 0.0
+        bw, ow = _median_width(band), _median_width(both)
+        pw = int(cfg["projectors"][k]["width"])
+        frac = max(wins[k][1] - wins[k][0], 1e-3)
+        seams.append(dict(k=k,
+                          band_px_canvas=round(bw, 1),
+                          band_px_projector=round(bw * pw / max(Wc * frac, 1e-6), 1),
+                          overlap_canvas_px=round(ow, 1),
+                          sum_median=round(float(np.median(total[both])) if both.any() else 0.0, 4)))
+        x = int(round(wins[k][1] * Wc))
+        cv2.line(img, (x, 0), (x, Hc - 1), (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(img, f"P{k}-P{k+1}", (max(2, x + 4), Hc - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # ¿los mapas de output/ son más viejos que estos escaneos/bordes?
+    out = Path(work).parent / cfg.get("output_dir", "output")
+    stale = False
+    maps = sorted(out.glob("proj*_map.exr"))
+    if maps:
+        newest = 0.0
+        for i in range(len(cfg.get("projectors", []))):
+            for pat in (f"scan_proj{i}.npz", f"screen_proj{i}.json"):
+                for p in Path(work).glob(pat):
+                    newest = max(newest, p.stat().st_mtime)
+        stale = min(p.stat().st_mtime for p in maps) < newest
+    return {"img": cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+            "source": "huellas reales de tus escaneos",
+            "seams": seams, "stale_maps": bool(stale),
+            "canvas": {"width": Wc, "height": Hc}}
+
 
 def render_projector(r, content=None, gamma=2.2, black=0.0, uniformity=1.0, white=False):
     u, v, w = r["u"], r["v"], r["w"]
